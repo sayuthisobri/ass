@@ -186,9 +186,11 @@ type model struct {
 	selectedRole    RoleItem
 	profileName     string
 	outputMessage   string // For displaying success output in View()
+	namePrefix      string
+	nameSuffix      string
 }
 
-func initialModel(ssoSession, region, ssoRegion, outputFormat string, writeCreds bool) model {
+func initialModel(ssoSession, region, ssoRegion, outputFormat string, writeCreds bool, namePrefix, nameSuffix string) model {
 	l := list.New([]list.Item{}, NewAccountDelegate(), 0, 0)
 	l.Title = "Loading AWS SSO Accounts..."
 	l.Styles.Title = titleStyle
@@ -228,6 +230,8 @@ func initialModel(ssoSession, region, ssoRegion, outputFormat string, writeCreds
 		height:       24,
 		writeCreds:   writeCreds,
 		outputFormat: outputFormat,
+		namePrefix:   namePrefix,
+		nameSuffix:   nameSuffix,
 	}
 }
 
@@ -726,10 +730,13 @@ func (m model) configureAWSProfile(account AccountItem, roleItem RoleItem, origi
 		roleName := cleanRoleName(selectedRole.RoleName)
 		// Build the full profile name
 		profileName := fmt.Sprintf("%s%s%s", alias, accountName, roleName)
-		// Remove "BIMB" prefix if present
-		profileName = strings.TrimPrefix(profileName, "BIMB")
-		// Remove "ComputeDevops" suffix if present
-		profileName = strings.TrimSuffix(profileName, "ComputeDevops")
+		// Strip configured prefix/suffix from the profile name
+		if m.namePrefix != "" {
+			profileName = strings.TrimPrefix(profileName, m.namePrefix)
+		}
+		if m.nameSuffix != "" {
+			profileName = strings.TrimSuffix(profileName, m.nameSuffix)
+		}
 
 		// Read existing config
 		existingConfig, err := os.ReadFile(configPath)
@@ -1101,7 +1108,7 @@ func withTokenRefresh(ssoSession string, fn func(token string) error) error {
 	return fn(token)
 }
 
-func configureAllProfiles(ssoSession, region, ssoRegion, outputFormat string, writeCreds bool) {
+func configureAllProfiles(ssoSession, region, ssoRegion, outputFormat string, writeCreds bool, namePrefix, nameSuffix string) {
 	fmt.Printf("Checking SSO session '%s'...\n", ssoSession)
 
 	token, err := getSSOTokenFromCache(ssoSession)
@@ -1160,8 +1167,12 @@ func configureAllProfiles(ssoSession, region, ssoRegion, outputFormat string, wr
 			accountName := strings.Join(parts[1:], "")
 			roleName := cleanRoleName(displayRoleName)
 			profileName := fmt.Sprintf("%s%s%s", alias, accountName, roleName)
-			profileName = strings.TrimPrefix(profileName, "BIMB")
-			profileName = strings.TrimSuffix(profileName, "ComputeDevops")
+			if namePrefix != "" {
+				profileName = strings.TrimPrefix(profileName, namePrefix)
+			}
+			if nameSuffix != "" {
+				profileName = strings.TrimSuffix(profileName, nameSuffix)
+			}
 
 			// Read current config
 			existingConfig, err := os.ReadFile(configPath)
@@ -1289,6 +1300,8 @@ func main() {
 		fmt.Println("  ass clean-config          # Clean corrupted [[profile entries")
 		fmt.Println("  AWS_SSO_SESSION=bimb ass  # Specify session")
 		fmt.Println("  AWS_REGION=us-east-1 ass  # Specify region")
+		fmt.Println("  AWS_PROFILE_NAME_PREFIX=Org ass  # Strip prefix from generated profile name")
+		fmt.Println("  AWS_PROFILE_NAME_SUFFIX=Role ass  # Strip suffix from generated profile name")
 		fmt.Println()
 		fmt.Println("Prerequisites:")
 		fmt.Println("  1. AWS CLI v2 installed")
@@ -1302,7 +1315,18 @@ func main() {
 	var outputFormat string
 	flag.StringVar(&outputFormat, "output-format", "yaml", "Output format for AWS CLI (json, yaml)")
 	flag.StringVar(&outputFormat, "o", "yaml", "Output format (short for --output-format)")
+	var namePrefix string
+	var nameSuffix string
+	flag.StringVar(&namePrefix, "name-prefix", "", "Prefix to strip from generated profile names (or set AWS_PROFILE_NAME_PREFIX)")
+	flag.StringVar(&nameSuffix, "name-suffix", "", "Suffix to strip from generated profile names (or set AWS_PROFILE_NAME_SUFFIX)")
 	flag.Parse()
+
+	if namePrefix == "" {
+		namePrefix = os.Getenv("AWS_PROFILE_NAME_PREFIX")
+	}
+	if nameSuffix == "" {
+		nameSuffix = os.Getenv("AWS_PROFILE_NAME_SUFFIX")
+	}
 
 	// Get SSO session from environment or default
 	ssoSession := os.Getenv("AWS_SSO_SESSION")
@@ -1377,7 +1401,7 @@ func main() {
 
 	// Configure all profiles command
 	if len(os.Args) > 1 && os.Args[1] == "all" {
-		configureAllProfiles(ssoSession, region, ssoRegion, outputFormat, *writeCreds)
+		configureAllProfiles(ssoSession, region, ssoRegion, outputFormat, *writeCreds, namePrefix, nameSuffix)
 		os.Exit(0)
 	}
 
@@ -1407,7 +1431,7 @@ func main() {
 	fmt.Println(successStyle.Render("✓ SSO token found"))
 	fmt.Println()
 
-	m := initialModel(ssoSession, region, ssoRegion, outputFormat, *writeCreds)
+	m := initialModel(ssoSession, region, ssoRegion, outputFormat, *writeCreds, namePrefix, nameSuffix)
 	m.accessToken = token
 
 	p := tea.NewProgram(m, tea.WithAltScreen())

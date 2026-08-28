@@ -36,6 +36,9 @@ make build
 ass                              # interactive selector
 ass all                          # configure all accounts/roles
 ass --write-creds                # also write credentials to ~/.aws/credentials
+ass --dry-run                    # preview what would be configured without writing files
+ass --dry-run all                # preview all profiles without writing
+ass --dry-run clean-config       # preview cleanup without writing
 ass --output-format json         # or yaml
 AWS_SSO_SESSION=my-session ass   # pick a session
 AWS_REGION=us-east-1 ass         # override region

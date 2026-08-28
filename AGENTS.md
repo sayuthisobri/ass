@@ -43,6 +43,26 @@ The `ass` program helps users easily select and configure AWS accounts and roles
 
 - `AWS_SSO_SESSION`: Specify the SSO session name
 - `AWS_REGION`: Set the AWS region (defaults to ap-southeast-1)
+- `AWS_PROFILE_NAME_PREFIX`: Prefix to strip from generated profile names
+- `AWS_PROFILE_NAME_SUFFIX`: Suffix to strip from generated profile names
+
+### Default Config File
+
+Defaults can be loaded from a YAML file searched in this order (first hit wins):
+
+1. `$XDG_CONFIG_HOME/ass/ass.yaml`
+2. `~/ass.yaml`
+
+Example `ass.yaml`:
+
+```yaml
+sso_session: my-sso
+region: ap-southeast-1
+profile_name_prefix: BIMB
+profile_name_suffix: ComputeDevops
+```
+
+Precedence (highest wins): CLI flag → env var → config file → built-in default.
 
 ### Dependencies
 

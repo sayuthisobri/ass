@@ -20,6 +20,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -182,6 +183,7 @@ type model struct {
 	height          int
 	writeCreds      bool
 	outputFormat    string
+	dryRun          bool
 	selectedAccount AccountItem
 	selectedRole    RoleItem
 	profileName     string
@@ -190,7 +192,7 @@ type model struct {
 	nameSuffix      string
 }
 
-func initialModel(ssoSession, region, ssoRegion, outputFormat string, writeCreds bool, namePrefix, nameSuffix string) model {
+func initialModel(ssoSession, region, ssoRegion, outputFormat string, writeCreds, dryRun bool, namePrefix, nameSuffix string) model {
 	l := list.New([]list.Item{}, NewAccountDelegate(), 0, 0)
 	l.Title = "Loading AWS SSO Accounts..."
 	l.Styles.Title = titleStyle
@@ -229,6 +231,7 @@ func initialModel(ssoSession, region, ssoRegion, outputFormat string, writeCreds
 		width:        80,
 		height:       24,
 		writeCreds:   writeCreds,
+		dryRun:       dryRun,
 		outputFormat: outputFormat,
 		namePrefix:   namePrefix,
 		nameSuffix:   nameSuffix,
@@ -564,7 +567,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateDone
 		m.profileName = msg.profileName
 		m.outputMessage = msg.output
-		m.statusMessage = "AWS profile configured successfully!"
+		if m.dryRun {
+			m.statusMessage = "AWS profile would be configured (dry-run)"
+		} else {
+			m.statusMessage = "AWS profile configured successfully!"
+		}
 		return m, nil
 
 	case tea.WindowSizeMsg:
@@ -792,30 +799,33 @@ output = %s
 		configContent += newProfile
 
 		// Write back to config file
-		if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
-			return errMsg{err: fmt.Errorf("failed to write AWS config: %w", err)}
-		}
-
-		// Get role credentials
-		ssoCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(m.ssoRegion))
-		if err != nil {
-			return errMsg{err: fmt.Errorf("failed to load config for sso client: %w", err)}
-		}
-		ssoClient := sso.NewFromConfig(ssoCfg)
-
-		roleCredentials, err := ssoClient.GetRoleCredentials(ctx, &sso.GetRoleCredentialsInput{
-			AccessToken: aws.String(m.accessToken),
-			AccountId:   aws.String(selectedAccount.AccountID),
-			RoleName:    aws.String(originalRoleName),
-		})
-		if err != nil {
-			if isExpiredTokenError(err) {
-				return errMsg{err: fmt.Errorf("access token has expired. Browser authentication required.")}
+		if !m.dryRun {
+			if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+				return errMsg{err: fmt.Errorf("failed to write AWS config: %w", err)}
 			}
-			return errMsg{err: fmt.Errorf("failed to get role credentials: %w", err)}
 		}
 
-		if m.writeCreds {
+		// Get role credentials and write credentials file (only when not dry-run)
+		if m.writeCreds && !m.dryRun {
+			// Get role credentials
+			ssoCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(m.ssoRegion))
+			if err != nil {
+				return errMsg{err: fmt.Errorf("failed to load config for sso client: %w", err)}
+			}
+			ssoClient := sso.NewFromConfig(ssoCfg)
+
+			roleCredentials, err := ssoClient.GetRoleCredentials(ctx, &sso.GetRoleCredentialsInput{
+				AccessToken: aws.String(m.accessToken),
+				AccountId:   aws.String(selectedAccount.AccountID),
+				RoleName:    aws.String(originalRoleName),
+			})
+			if err != nil {
+				if isExpiredTokenError(err) {
+					return errMsg{err: fmt.Errorf("access token has expired. Browser authentication required.")}
+				}
+				return errMsg{err: fmt.Errorf("failed to get role credentials: %w", err)}
+			}
+
 			// Create credentials file
 			credentialsPath := filepath.Join(homeDir, ".aws", "credentials")
 			existingCreds, err := os.ReadFile(credentialsPath)
@@ -855,10 +865,19 @@ aws_session_token = %s
 			}
 		}
 
-		m.statusMessage = fmt.Sprintf("Profile '%s' configured successfully!", profileName)
+		if m.dryRun {
+			m.statusMessage = fmt.Sprintf("Profile '%s' would be configured (dry-run)", profileName)
+		} else {
+			m.statusMessage = fmt.Sprintf("Profile '%s' configured successfully!", profileName)
+		}
 
 		// Build output string
-		output := "\n" + successStyle.Render("✓ AWS Profile Configured!")
+		output := "\n"
+		if m.dryRun {
+			output += lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA500")).Bold(true).Render("⚠ DRY RUN - No files were modified")
+		} else {
+			output += successStyle.Render("✓ AWS Profile Configured!")
+		}
 		output += fmt.Sprintf("\n\nProfile Name: %s", lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFDF5")).Bold(true).Render(profileName))
 		output += fmt.Sprintf("\nAccount: %s (%s, %s)", selectedAccount.AccountName, selectedAccount.AccountID, selectedAccount.Email)
 		output += fmt.Sprintf("\nRole: %s (%s)", selectedRole.RoleName, originalRoleName)
@@ -869,10 +888,14 @@ aws_session_token = %s
 			credentialsPath := filepath.Join(homeDir, ".aws", "credentials")
 			output += fmt.Sprintf("\nCredentials File: %s", credentialsPath)
 		}
-		output += "\n\nUsage Instructions:"
-		output += fmt.Sprintf("\n  - Set the profile: export AWS_PROFILE=%s", profileName)
-		output += fmt.Sprintf("\n  - List S3 buckets: aws s3 ls --profile %s", profileName)
-		output += fmt.Sprintf("\n  - Or use directly: AWS_PROFILE=%s aws s3 ls", profileName)
+		if m.dryRun {
+			output += fmt.Sprintf("\n\nNote: Profile will be written to '%s' when run without --dry-run", configPath)
+		} else {
+			output += "\n\nUsage Instructions:"
+			output += fmt.Sprintf("\n  - Set the profile: export AWS_PROFILE=%s", profileName)
+			output += fmt.Sprintf("\n  - List S3 buckets: aws s3 ls --profile %s", profileName)
+			output += fmt.Sprintf("\n  - Or use directly: AWS_PROFILE=%s aws s3 ls", profileName)
+		}
 		output += "\n"
 
 		return configuredMsg{profileName: profileName, output: output}
@@ -943,13 +966,18 @@ func parseProfiles(content string) []Profile {
 	return profiles
 }
 
-func cleanConfig() {
+func cleanConfig(dryRun bool) {
 	var credsExists bool
 	var credsCleaned bool
 	var credsContent string
 	var originalCreds string
 
 	fmt.Println("Cleaning corrupted profile entries and removing duplicates...")
+
+	if dryRun {
+		fmt.Println(helpStyle.Render("⚠ DRY RUN Mode - no files will be modified"))
+		fmt.Println()
+	}
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -1036,13 +1064,17 @@ func cleanConfig() {
 
 	// Write back config if changed
 	if configContent != originalConfig {
-		if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
-			fmt.Println(errorStyle.Render(fmt.Sprintf("✗ Error writing config: %v", err)))
+		if dryRun {
+			fmt.Println(helpStyle.Render("  [dry-run] Would write cleaned config"))
 		} else {
-			if configCleaned {
-				fmt.Println(successStyle.Render("✓ Config cleaned and duplicates removed"))
+			if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+				fmt.Println(errorStyle.Render(fmt.Sprintf("✗ Error writing config: %v", err)))
 			} else {
-				fmt.Println(successStyle.Render("✓ Duplicate profiles removed from config"))
+				if configCleaned {
+					fmt.Println(successStyle.Render("✓ Config cleaned and duplicates removed"))
+				} else {
+					fmt.Println(successStyle.Render("✓ Duplicate profiles removed from config"))
+				}
 			}
 		}
 	} else {
@@ -1052,13 +1084,17 @@ func cleanConfig() {
 	// Write back credentials if changed
 	if credsExists {
 		if credsContent != originalCreds {
-			if err := os.WriteFile(credsPath, []byte(credsContent), 0600); err != nil {
-				fmt.Println(errorStyle.Render(fmt.Sprintf("✗ Error writing credentials: %v", err)))
+			if dryRun {
+				fmt.Println(helpStyle.Render("  [dry-run] Would write cleaned credentials"))
 			} else {
-				if credsCleaned {
-					fmt.Println(successStyle.Render("✓ Credentials cleaned and duplicates removed"))
+				if err := os.WriteFile(credsPath, []byte(credsContent), 0600); err != nil {
+					fmt.Println(errorStyle.Render(fmt.Sprintf("✗ Error writing credentials: %v", err)))
 				} else {
-					fmt.Println(successStyle.Render("✓ Duplicate profiles removed from credentials"))
+					if credsCleaned {
+						fmt.Println(successStyle.Render("✓ Credentials cleaned and duplicates removed"))
+					} else {
+						fmt.Println(successStyle.Render("✓ Duplicate profiles removed from credentials"))
+					}
 				}
 			}
 		} else {
@@ -1068,7 +1104,11 @@ func cleanConfig() {
 
 	// Report duplicates removed
 	if len(duplicates) > 0 {
-		fmt.Printf("Removed %d duplicate profile(s): %s\n", len(duplicates), strings.Join(duplicates, ", "))
+		if dryRun {
+			fmt.Printf("Would remove %d duplicate profile(s): %s\n", len(duplicates), strings.Join(duplicates, ", "))
+		} else {
+			fmt.Printf("Removed %d duplicate profile(s): %s\n", len(duplicates), strings.Join(duplicates, ", "))
+		}
 	} else {
 		fmt.Println("No duplicate profiles found")
 	}
@@ -1108,8 +1148,13 @@ func withTokenRefresh(ssoSession string, fn func(token string) error) error {
 	return fn(token)
 }
 
-func configureAllProfiles(ssoSession, region, ssoRegion, outputFormat string, writeCreds bool, namePrefix, nameSuffix string) {
+func configureAllProfiles(ssoSession, region, ssoRegion, outputFormat string, writeCreds, dryRun bool, namePrefix, nameSuffix string) {
 	fmt.Printf("Checking SSO session '%s'...\n", ssoSession)
+
+	if dryRun {
+		fmt.Println(helpStyle.Render("⚠ DRY RUN Mode - no files will be modified"))
+		fmt.Println()
+	}
 
 	token, err := getSSOTokenFromCache(ssoSession)
 	if err != nil {
@@ -1230,14 +1275,16 @@ func configureAllProfiles(ssoSession, region, ssoRegion, outputFormat string, wr
 			newProfile := fmt.Sprintf("\n[profile %s]\nsso_session = %s\nsso_account_id = %s\nsso_role_name = %s\nregion = %s\noutput = %s\n", profileName, ssoSession, account.AccountID, originalRoleName, region, outputFormat)
 			configContent += newProfile
 
-			if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
-				fmt.Printf("  %s\n", errorStyle.Render(fmt.Sprintf("✗ %s: failed to write config: %v", displayRoleName, err)))
-				failed++
-				continue
+			if !dryRun {
+				if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+					fmt.Printf("  %s\n", errorStyle.Render(fmt.Sprintf("✗ %s: failed to write config: %v", displayRoleName, err)))
+					failed++
+					continue
+				}
 			}
 
 			// Handle credentials if requested
-			if writeCreds {
+			if writeCreds && !dryRun {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				ssoCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(ssoRegion))
 				if err == nil {
@@ -1274,44 +1321,61 @@ func configureAllProfiles(ssoSession, region, ssoRegion, outputFormat string, wr
 				cancel()
 			}
 
-			if existingProfileName != "" {
-				fmt.Printf("  %s\n", successStyle.Render(fmt.Sprintf("✓ %s → '%s' (replaced '%s')", displayRoleName, profileName, existingProfileName)))
+			if dryRun {
+				if existingProfileName != "" {
+					fmt.Printf("  %s\n", helpStyle.Render(fmt.Sprintf("- %s → '%s' (would replace '%s')", displayRoleName, profileName, existingProfileName)))
+				} else {
+					fmt.Printf("  %s\n", helpStyle.Render(fmt.Sprintf("- %s → '%s' (would configure)", displayRoleName, profileName)))
+				}
 			} else {
-				fmt.Printf("  %s\n", successStyle.Render(fmt.Sprintf("✓ %s → '%s'", displayRoleName, profileName)))
+				if existingProfileName != "" {
+					fmt.Printf("  %s\n", successStyle.Render(fmt.Sprintf("✓ %s → '%s' (replaced '%s')", displayRoleName, profileName, existingProfileName)))
+				} else {
+					fmt.Printf("  %s\n", successStyle.Render(fmt.Sprintf("✓ %s → '%s'", displayRoleName, profileName)))
+				}
 			}
 			configured++
 		}
 	}
 
-	fmt.Println()
-	fmt.Println(successStyle.Render(fmt.Sprintf("Done! Configured: %d, Skipped: %d, Failed: %d", configured, skipped, failed)))
+	if dryRun {
+		fmt.Println(helpStyle.Render(fmt.Sprintf("Done (dry-run)! Would configure: %d, Skipped: %d, Failed: %d", configured, skipped, failed)))
+	} else {
+		fmt.Println(successStyle.Render(fmt.Sprintf("Done! Configured: %d, Skipped: %d, Failed: %d", configured, skipped, failed)))
+	}
 }
 
 func main() {
+	loadDefaultConfig()
+
 	// Check if user wants to see help before parsing flags
-	if len(os.Args) > 1 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
-		fmt.Println("AWS SSO Account Selector")
-		fmt.Println()
-		fmt.Println("Usage:")
-		fmt.Println("  ass                       # Run selector")
-		fmt.Println("  ass --write-creds         # Write credentials to ~/.aws/credentials")
-		fmt.Println("  ass --output-format yaml  # Set output format (json, yaml)")
-		fmt.Println("  ass all                   # Configure all accounts and roles")
-		fmt.Println("  ass clean-config          # Clean corrupted [[profile entries")
-		fmt.Println("  AWS_SSO_SESSION=bimb ass  # Specify session")
-		fmt.Println("  AWS_REGION=us-east-1 ass  # Specify region")
-		fmt.Println("  AWS_PROFILE_NAME_PREFIX=Org ass  # Strip prefix from generated profile name")
-		fmt.Println("  AWS_PROFILE_NAME_SUFFIX=Role ass  # Strip suffix from generated profile name")
-		fmt.Println()
-		fmt.Println("Prerequisites:")
-		fmt.Println("  1. AWS CLI v2 installed")
-		fmt.Println("  2. SSO configured: aws configure sso")
-		fmt.Println("  3. Logged in: aws sso login --sso-session <session>")
-		fmt.Println()
-		os.Exit(0)
+	for _, arg := range os.Args[1:] {
+		if arg == "-h" || arg == "--help" {
+			fmt.Println("AWS SSO Account Selector")
+			fmt.Println()
+			fmt.Println("Usage:")
+			fmt.Println("  ass                       # Run selector")
+			fmt.Println("  ass --write-creds         # Write credentials to ~/.aws/credentials")
+			fmt.Println("  ass --dry-run             # Show what would be configured without writing files")
+			fmt.Println("  ass --output-format yaml  # Set output format (json, yaml)")
+			fmt.Println("  ass all                   # Configure all accounts and roles")
+			fmt.Println("  ass clean-config          # Clean corrupted profile entries in AWS config files")
+			fmt.Println("  AWS_SSO_SESSION=bimb ass  # Specify session")
+			fmt.Println("  AWS_REGION=us-east-1 ass  # Specify region")
+			fmt.Println("  AWS_PROFILE_NAME_PREFIX=Org ass  # Strip prefix from generated profile name")
+			fmt.Println("  AWS_PROFILE_NAME_SUFFIX=Role ass  # Strip suffix from generated profile name")
+			fmt.Println()
+			fmt.Println("Prerequisites:")
+			fmt.Println("  1. AWS CLI v2 installed")
+			fmt.Println("  2. SSO configured: aws configure sso")
+			fmt.Println("  3. Logged in: aws sso login --sso-session <session>")
+			fmt.Println()
+			os.Exit(0)
+		}
 	}
 
 	var writeCreds = flag.Bool("write-creds", false, "Write temporary credentials to ~/.aws/credentials")
+	var dryRun = flag.Bool("dry-run", false, "Show what would be configured without writing files")
 	var outputFormat string
 	flag.StringVar(&outputFormat, "output-format", "yaml", "Output format for AWS CLI (json, yaml)")
 	flag.StringVar(&outputFormat, "o", "yaml", "Output format (short for --output-format)")
@@ -1322,14 +1386,14 @@ func main() {
 	flag.Parse()
 
 	if namePrefix == "" {
-		namePrefix = os.Getenv("AWS_PROFILE_NAME_PREFIX")
+		namePrefix = envOrConfig("AWS_PROFILE_NAME_PREFIX", defaultCfg.ProfileNamePrefix)
 	}
 	if nameSuffix == "" {
-		nameSuffix = os.Getenv("AWS_PROFILE_NAME_SUFFIX")
+		nameSuffix = envOrConfig("AWS_PROFILE_NAME_SUFFIX", defaultCfg.ProfileNameSuffix)
 	}
 
 	// Get SSO session from environment or default
-	ssoSession := os.Getenv("AWS_SSO_SESSION")
+	ssoSession := envOrConfig("AWS_SSO_SESSION", defaultCfg.SSOSession)
 	if ssoSession == "" {
 		// Try to detect from AWS config
 		homeDir, err := os.UserHomeDir()
@@ -1354,7 +1418,7 @@ func main() {
 		}
 	}
 
-	region := os.Getenv("AWS_REGION")
+	region := envOrConfig("AWS_REGION", defaultCfg.Region)
 	if region == "" {
 		region = "ap-southeast-1" // Default fallback
 	}
@@ -1394,14 +1458,15 @@ func main() {
 	}
 
 	// Clean config command
-	if len(os.Args) > 1 && os.Args[1] == "clean-config" {
-		cleanConfig()
+	args := flag.Args()
+	if len(args) > 0 && args[0] == "clean-config" {
+		cleanConfig(*dryRun)
 		os.Exit(0)
 	}
 
 	// Configure all profiles command
-	if len(os.Args) > 1 && os.Args[1] == "all" {
-		configureAllProfiles(ssoSession, region, ssoRegion, outputFormat, *writeCreds, namePrefix, nameSuffix)
+	if len(args) > 0 && args[0] == "all" {
+		configureAllProfiles(ssoSession, region, ssoRegion, outputFormat, *writeCreds, *dryRun, namePrefix, nameSuffix)
 		os.Exit(0)
 	}
 
@@ -1431,7 +1496,7 @@ func main() {
 	fmt.Println(successStyle.Render("✓ SSO token found"))
 	fmt.Println()
 
-	m := initialModel(ssoSession, region, ssoRegion, outputFormat, *writeCreds, namePrefix, nameSuffix)
+	m := initialModel(ssoSession, region, ssoRegion, outputFormat, *writeCreds, *dryRun, namePrefix, nameSuffix)
 	m.accessToken = token
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -1439,4 +1504,46 @@ func main() {
 		fmt.Println(errorStyle.Render(fmt.Sprintf("Error: %v", err)))
 		os.Exit(1)
 	}
+}
+
+type defaultConfig struct {
+	SSOSession        string `yaml:"sso_session"`
+	Region            string `yaml:"region"`
+	ProfileNamePrefix string `yaml:"profile_name_prefix"`
+	ProfileNameSuffix string `yaml:"profile_name_suffix"`
+}
+
+var defaultCfg defaultConfig
+
+func loadDefaultConfig() {
+	for _, p := range defaultConfigPaths() {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var cfg defaultConfig
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
+		defaultCfg = cfg
+		return
+	}
+}
+
+func defaultConfigPaths() []string {
+	paths := []string{}
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		paths = append(paths, filepath.Join(xdg, "ass", "ass.yaml"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, "ass.yaml"))
+	}
+	return paths
+}
+
+func envOrConfig(envKey, fallback string) string {
+	if v := os.Getenv(envKey); v != "" {
+		return v
+	}
+	return fallback
 }
